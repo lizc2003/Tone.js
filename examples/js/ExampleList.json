@@ -16,6 +16,7 @@
 		"FatOscillator" : "jump",
 		"MetalSynth" : "bembe",
 		"Granular Synthesis" : "grainPlayer",
+		"Time Stretch" : "timeStretchPlayer",
 		"Sampler" : "sampler"
 	},
 	"Effects" : {

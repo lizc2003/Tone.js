@@ -1,6 +1,7 @@
 export * from "./buffer/GrainPlayer.js";
 export * from "./buffer/Player.js";
 export * from "./buffer/Players.js";
+export * from "./buffer/TimeStretchPlayer.js";
 export * from "./buffer/ToneBufferSource.js";
 export * from "./Noise.js";
 export * from "./oscillator/AMOscillator.js";

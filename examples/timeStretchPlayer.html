@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>TimeStretchPlayer - Time Stretching and Pitch Shifting</title>
+	<script src="../build/Tone.js"></script>
+	<script src="./js/tone-ui.js"></script>
+	<script src="./js/components.js"></script>
+	<style>
+		body {
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+			max-width: 800px;
+			margin: 0 auto;
+			padding: 20px;
+			background: #1a1a2e;
+			color: #eee;
+		}
+		h1 {
+			color: #00d9ff;
+		}
+		.control-group {
+			margin: 20px 0;
+			padding: 15px;
+			background: #16213e;
+			border-radius: 8px;
+		}
+		label {
+			display: block;
+			margin-bottom: 8px;
+			font-weight: 500;
+			color: #00d9ff;
+		}
+		input[type="range"] {
+			width: 100%;
+			margin: 10px 0;
+		}
+		.value-display {
+			font-size: 1.2em;
+			color: #fff;
+			font-weight: bold;
+		}
+		button {
+			background: #00d9ff;
+			color: #1a1a2e;
+			border: none;
+			padding: 12px 24px;
+			border-radius: 6px;
+			font-size: 16px;
+			cursor: pointer;
+			margin: 5px;
+			font-weight: 600;
+		}
+		button:hover {
+			background: #00b8d9;
+		}
+		button:disabled {
+			background: #4a4a5a;
+			cursor: not-allowed;
+		}
+		.info {
+			background: #0f3460;
+			padding: 15px;
+			border-radius: 8px;
+			margin: 20px 0;
+			border-left: 4px solid #00d9ff;
+		}
+		#status {
+			padding: 10px;
+			background: #0f3460;
+			border-radius: 6px;
+			margin: 10px 0;
+		}
+	</style>
+</head>
+<body>
+	<h1>🎵 TimeStretchPlayer Demo</h1>
+	
+	<div class="info">
+		<strong>⚠️ Note:</strong> TimeStretchPlayer uses SoundTouch via AudioWorklet for real-time 
+		time-stretching and pitch-shifting. This allows you to:
+		<ul>
+			<li><strong>Tempo:</strong> Change playback speed without affecting pitch</li>
+			<li><strong>Pitch:</strong> Change pitch (in semitones) without affecting speed</li>
+		</ul>
+	</div>
+
+	<div class="control-group">
+		<label>Tempo (Speed without pitch change): <span class="value-display" id="tempoValue">1.00x</span></label>
+		<input type="range" id="tempo" min="0.5" max="2.0" step="0.01" value="1.0">
+	</div>
+
+	<div class="control-group">
+		<label>Pitch Shift: <span class="value-display" id="pitchValue">0 semitones</span></label>
+		<input type="range" id="pitch" min="-12" max="12" step="0.5" value="0">
+	</div>
+
+	<div class="control-group">
+		<button id="startBtn">▶ Start</button>
+		<button id="stopBtn" disabled>⏹ Stop</button>
+		<label style="display: inline-flex; align-items: center; margin-left: 20px;">
+			<input type="checkbox" id="loop" checked> Loop
+		</label>
+	</div>
+
+	<div id="status">Status: Ready - Click Start to begin</div>
+
+	<script type="module">
+		// Note: This example assumes you have the soundtouch WASM and JS code available
+		// In a real application, you would need to:
+		// 1. Install soundtouch: npm install soundtouch
+		// 2. Load the WASM bytes and JS code
+		
+		// For this demo, we'll show how the API would be used
+		
+		const tempoSlider = document.getElementById('tempo');
+		const pitchSlider = document.getElementById('pitch');
+		const tempoValue = document.getElementById('tempoValue');
+		const pitchValue = document.getElementById('pitchValue');
+		const startBtn = document.getElementById('startBtn');
+		const stopBtn = document.getElementById('stopBtn');
+		const loopCheckbox = document.getElementById('loop');
+		const status = document.getElementById('status');
+
+		let player = null;
+		let isPlaying = false;
+
+		// Update display values
+		tempoSlider.addEventListener('input', () => {
+			tempoValue.textContent = `${parseFloat(tempoSlider.value).toFixed(2)}x`;
+			if (player) {
+				player.tempo = parseFloat(tempoSlider.value);
+			}
+		});
+
+		pitchSlider.addEventListener('input', () => {
+			const val = parseFloat(pitchSlider.value);
+			pitchValue.textContent = `${val > 0 ? '+' : ''}${val.toFixed(1)} semitones`;
+			if (player) {
+				player.pitch = val;
+			}
+		});
+
+		loopCheckbox.addEventListener('change', () => {
+			if (player) {
+				player.loop = loopCheckbox.checked;
+			}
+		});
+
+		startBtn.addEventListener('click', async () => {
+			try {
+				status.textContent = 'Status: Starting audio context...';
+				await Tone.start();
+				
+				status.textContent = 'Status: Loading SoundTouch WASM...';
+				
+				// In a real application, load the WASM and JS code:
+				// const wasmResponse = await fetch('node_modules/soundtouch/soundtouch_bg.wasm');
+				// const wasmBytes = await wasmResponse.arrayBuffer();
+				// const soundtouchCode = await (await fetch('node_modules/soundtouch/soundtouch_worklet.js')).text();
+				
+				// For now, show how to use the TimeStretchPlayer API
+				// Note: You need to have soundtouch installed and provide the actual files
+				
+			status.textContent = 'Status: Creating TimeStretchPlayer...';
+			
+			const wasmResponse = await fetch('./soundtouch/soundtouch_bg.wasm');
+			const wasmBytes = await wasmResponse.arrayBuffer();
+			const soundtouchCode = await (await fetch('./soundtouch/soundtouch_worklet.js')).text();
+
+			// Example usage (requires actual soundtouch files):
+			player = new Tone.TimeStretchPlayer({
+				url: "./sample.mp3",
+				loop: loopCheckbox.checked,
+				tempo: parseFloat(tempoSlider.value),
+				pitch: parseFloat(pitchSlider.value),
+				onload: async () => {
+					status.textContent = 'Status: Audio loaded! Starting playback...';
+					// Load the SoundTouch dependencies
+					await player.loadSoundTouch(wasmBytes, soundtouchCode);
+					// Start playback after buffer is loaded
+					player.start();
+					status.textContent = 'Status: Playing!';
+					isPlaying = true;
+					startBtn.disabled = true;
+					stopBtn.disabled = false;
+				}
+			}).toDestination();
+				
+			} catch (err) {
+				status.textContent = `Status: Error - ${err.message}`;
+				console.error(err);
+			}
+		});
+
+		stopBtn.addEventListener('click', () => {
+			if (player) {
+				player.stop();
+			}
+			isPlaying = false;
+			startBtn.disabled = false;
+			stopBtn.disabled = true;
+			status.textContent = 'Status: Stopped';
+		});
+	</script>
+	
+	<div class="info" style="margin-top: 30px;">
+		<h3>Usage Example (Code)</h3>
+		<pre style="background: #1a1a2e; padding: 15px; border-radius: 6px; overflow-x: auto;">
+<code>// Load SoundTouch WASM and JS code
+const wasmResponse = await fetch('./soundtouch/soundtouch_bg.wasm');
+const wasmBytes = await wasmResponse.arrayBuffer();
+const soundtouchCode = await (await fetch('./soundtouch/soundtouch_worklet.js')).text();
+
+// Create TimeStretchPlayer
+const player = new Tone.TimeStretchPlayer({
+  url: "audio.mp3",
+  loop: true,
+  tempo: 1.0,
+  pitch: 0,
+  onload: () => console.log('Loaded!')
+}).toDestination();
+
+// Load SoundTouch dependencies
+await player.loadSoundTouch(wasmBytes, soundtouchCode);
+
+// Start playback
+player.start();
+
+// Change tempo (1.5 = 50% faster, no pitch change)
+player.tempo = 1.5;
+
+// Change pitch (+5 semitones, no speed change)
+player.pitch = 5;</code></pre>
+	</div>
+</body>
+</html>
+
