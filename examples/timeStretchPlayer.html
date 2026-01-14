@@ -174,10 +174,10 @@
 				loop: loopCheckbox.checked,
 				tempo: parseFloat(tempoSlider.value),
 				pitch: parseFloat(pitchSlider.value),
+				wasmBytes: wasmBytes,
+				soundtouchCode: soundtouchCode,
 				onload: async () => {
 					status.textContent = 'Status: Audio loaded! Starting playback...';
-					// Load the SoundTouch dependencies
-					await player.loadSoundTouch(wasmBytes, soundtouchCode);
 					// Start playback after buffer is loaded
 					player.start();
 					status.textContent = 'Status: Playing!';

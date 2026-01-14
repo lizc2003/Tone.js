@@ -1,3 +1,4 @@
+import { Gain } from "../../core/context/Gain.js";
 import { ToneAudioBuffer } from "../../core/context/ToneAudioBuffer.js";
 import { connect } from "../../core/context/ToneAudioNode.js";
 import { Cents, Positive, Seconds, Time } from "../../core/type/Units.js";
@@ -7,6 +8,11 @@ import { defaultArg, optionsFromArguments } from "../../core/util/Defaults.js";
 import { noOp } from "../../core/util/Interface.js";
 import { Source, SourceOptions } from "../Source.js";
 import { workletName, timeStretchWorkletCode } from "./TimeStretch.worklet.js";
+
+/**
+ * The curve applied to fade in/out, either "linear" or "exponential"
+ */
+export type FadeCurve = "linear" | "exponential";
 
 export interface TimeStretchPlayerOptions extends SourceOptions {
 	onload: () => void;
@@ -20,11 +26,17 @@ export interface TimeStretchPlayerOptions extends SourceOptions {
 	reverse: boolean;
 	fadeIn: Time;
 	fadeOut: Time;
+	/** The curve applied to fade in/out, either "linear" or "exponential" */
+	fadeCurve: FadeCurve;
 	autostart: boolean;
-	/** URL to the SoundTouch WASM file */
-	wasmUrl?: string;
+	/** SoundTouch WASM file content */
+	wasmBytes?: ArrayBuffer;
 	/** The raw SoundTouch worklet JS code string */
 	soundtouchCode?: string;
+	/** Use quick seek mode for faster but lower quality time stretching */
+	useQuickSeek: boolean;
+	/** Use anti-alias filter for higher quality pitch shifting */
+	useAaFilter: boolean;
 }
 
 /**
@@ -42,7 +54,7 @@ export interface TimeStretchPlayerOptions extends SourceOptions {
  *
  * const player = new Tone.TimeStretchPlayer({
  *   url: "https://tonejs.github.io/audio/berklee/gong_1.mp3",
- *   wasmUrl: wasmBytes,
+ *   wasmBytes: wasmBytes,
  *   soundtouchCode: soundtouchCode,
  *   onload: () => {
  *     player.start();
@@ -121,6 +133,16 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	private _soundtouchCode: string = "";
 
 	/**
+	 * Use quick seek mode for faster but lower quality time stretching
+	 */
+	private _useQuickSeek: boolean = true;
+
+	/**
+	 * Use anti-alias filter for higher quality pitch shifting
+	 */
+	private _useAaFilter: boolean = false;
+
+	/**
 	 * Current playback position in samples
 	 */
 	private _currentPosition: number = 0;
@@ -128,7 +150,17 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	/**
 	 * The GainNode for fade in/out envelope
 	 */
-	private _fadeGainNode: GainNode;
+	private _fadeGainNode: Gain;
+
+	/**
+	 * The timeout id for stopping after fadeOut
+	 */
+	private _stopTimeoutId: number = -1;
+
+	/**
+	 * Whether the buffer is loaded
+	 */
+	private _loaded: boolean = false;
 
 	/**
 	 * The fadeIn time of the amplitude envelope.
@@ -141,6 +173,24 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 */
 	@timeRange(0)
 	fadeOut: Time;
+
+	/**
+	 * The curve applied to fade in/out
+	 */
+	private _fadeCurve: FadeCurve;
+
+	/**
+	 * The curve applied to the fades, either "linear" or "exponential".
+	 * Linear fades change at a constant rate, while exponential fades
+	 * change more gradually at first and then more rapidly.
+	 */
+	get fadeCurve(): FadeCurve {
+		return this._fadeCurve;
+	}
+
+	set fadeCurve(curve: FadeCurve) {
+		this._fadeCurve = curve;
+	}
 
 	/**
 	 * @param url Either the AudioBuffer or the url from which to load the AudioBuffer
@@ -167,7 +217,10 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		});
 
 		// Create fade gain node and connect to output
-		this._fadeGainNode = this.context.createGain();
+		this._fadeGainNode = new Gain({
+			context: this.context,
+			gain: 0,
+		});
 		connect(this._fadeGainNode, this.output);
 
 		this.autostart = options.autostart;
@@ -178,14 +231,17 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		this._loopEnd = options.loopEnd;
 		this.fadeIn = options.fadeIn;
 		this.fadeOut = options.fadeOut;
+		this._fadeCurve = options.fadeCurve;
 
-		// Store WASM and code
-		if (options.wasmUrl && typeof options.wasmUrl !== "string") {
-			this._wasmBytes = options.wasmUrl as unknown as ArrayBuffer;
+		// SoundTouch options
+		if (options.wasmBytes) {
+			this._wasmBytes = options.wasmBytes;
 		}
 		if (options.soundtouchCode) {
 			this._soundtouchCode = options.soundtouchCode;
 		}
+		this._useQuickSeek = options.useQuickSeek;
+		this._useAaFilter = options.useAaFilter;
 	}
 
 	static getDefaults(): TimeStretchPlayerOptions {
@@ -193,6 +249,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			autostart: false,
 			fadeIn: 0,
 			fadeOut: 0,
+			fadeCurve: "linear" as FadeCurve,
 			loop: false,
 			loopEnd: 0,
 			loopStart: 0,
@@ -201,20 +258,9 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			reverse: false,
 			pitch: 0 as Cents,
 			tempo: 1 as Positive,
+			useQuickSeek: true,
+			useAaFilter: false,
 		});
-	}
-
-	/**
-	 * Load the SoundTouch WASM module and worklet code
-	 * @param wasmBytes The WASM bytes (ArrayBuffer)
-	 * @param soundtouchCode The SoundTouch worklet JS code string
-	 */
-	async loadSoundTouch(
-		wasmBytes: ArrayBuffer,
-		soundtouchCode: string
-	): Promise<void> {
-		this._wasmBytes = wasmBytes;
-		this._soundtouchCode = soundtouchCode;
 	}
 
 	/**
@@ -225,24 +271,24 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		
 		// Check if worklet is already registered for this context
 		if (TimeStretchPlayer._workletRegisteredContexts.has(rawContext)) {
-			return;
+			return Promise.resolve();
 		}
 		
 		// Check if there's already an ongoing initialization for this context
 		const existingPromise = TimeStretchPlayer._workletInitPromises.get(rawContext);
 		if (existingPromise) {
 			await existingPromise;
-			return;
+			return Promise.resolve();
 		}
 
 		const initPromise = (async () => {
 			assert(
 				this._wasmBytes !== null,
-				"WASM bytes not loaded. Call loadSoundTouch() first or provide wasmUrl in options."
+				"SoundTouch WASM bytes not loaded."
 			);
 			assert(
 				this._soundtouchCode !== "",
-				"SoundTouch code not loaded. Call loadSoundTouch() first or provide soundtouchCode in options."
+				"SoundTouch code not loaded."
 			);
 
 			// Create worklet code blob
@@ -268,23 +314,32 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 
 	/**
 	 * Create the AudioWorkletNode
+	 * @param channels The number of audio channels
 	 */
-	private _createWorkletNode(): void {
+	private _createWorkletNode(channels: number): void {
+		// Clean up old worklet node properly
 		if (this._workletNode) {
+			// Dispose the old worklet to release WASM resources
+			this._workletNode.port.postMessage({ type: "dispose" });
+			this._workletNode.port.onmessage = null;
 			this._workletNode.disconnect();
+			this._workletNode = null;
 		}
 
 		// Use Tone's context createAudioWorkletNode method
 		this._workletNode = this.context.createAudioWorkletNode(workletName, {
 			numberOfInputs: 0,
 			numberOfOutputs: 1,
-			outputChannelCount: [2],
+			outputChannelCount: [channels],
 			processorOptions: {
 				sampleRate: this.context.sampleRate,
 				tempo: this._tempo,
 				pitch: this._pitch,
 				wasmBytes: this._wasmBytes,
 				soundtouchCode: this._soundtouchCode,
+				channels: channels,
+				useQuickSeek: this._useQuickSeek,
+				useAaFilter: this._useAaFilter,
 			},
 		});
 
@@ -327,10 +382,19 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 * Internal callback when the buffer is loaded
 	 */
 	private _onBufferLoad(callback: () => void = noOp): void {
-		callback();
-		if (this.autostart) {
-			this.start();
-		}
+		// Initialize worklet when buffer is loaded
+		this._initWorklet()
+			.then(() => {
+				this._loaded = true;
+				callback();
+				if (this.autostart) {
+					this.start();
+				}
+			})
+			.catch((err) => {
+				console.error("TimeStretchPlayer: Failed to initialize worklet:", err);
+				callback();
+			});
 	}
 
 	/**
@@ -356,16 +420,19 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	/**
 	 * Internal start method
 	 */
-	protected async _start(
+	protected _start(
 		startTime?: Time,
 		offset?: Time,
 		duration?: Time
-	): Promise<void> {
-		// Ensure worklet is initialized
-		await this._initWorklet();
+	): void {
+		// Clear any pending stop timeout to prevent it from stopping this new playback
+		this.context.clearTimeout(this._stopTimeoutId);
+		this._stopTimeoutId = -1;
 
-		// Create worklet node
-		this._createWorkletNode();
+		// Cancel all scheduled automation events and reset gain immediately
+		// Use time 0 to ensure we cancel everything, including ongoing ramps
+		this._fadeGainNode.gain.cancelScheduledValues(0);
+		this._fadeGainNode.gain.setValueAtTime(1, this.context.currentTime);
 
 		// Prepare audio data
 		const audioBuffer = this._buffer.get();
@@ -373,6 +440,15 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			console.warn("TimeStretchPlayer: Buffer not loaded");
 			return;
 		}
+
+		// Check if worklet is initialized
+		if (!TimeStretchPlayer._workletRegisteredContexts.has(this.context.rawContext)) {
+			console.error("TimeStretchPlayer: worklet not initialized");
+			return;
+		}
+
+		// Create worklet node with the correct number of channels
+		this._createWorkletNode(audioBuffer.numberOfChannels);
 
 		const audioData: Float32Array[] = [];
 		for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
@@ -392,7 +468,11 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		const fadeInTime = this.toSeconds(this.fadeIn);
 		if (fadeInTime > 0) {
 			this._fadeGainNode.gain.setValueAtTime(0, computedStartTime);
-			this._fadeGainNode.gain.linearRampToValueAtTime(1, computedStartTime + fadeInTime);
+			if (this._fadeCurve === "linear") {
+				this._fadeGainNode.gain.linearRampToValueAtTime(1, computedStartTime + fadeInTime);
+			} else {
+				this._fadeGainNode.gain.exponentialApproachValueAtTime(1, computedStartTime, fadeInTime);
+			}
 		} else {
 			this._fadeGainNode.gain.setValueAtTime(1, computedStartTime);
 		}
@@ -429,18 +509,32 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		const computedTime = this.toSeconds(time);
 		const fadeOutTime = this.toSeconds(this.fadeOut);
 
-		if (fadeOutTime > 0) {
-			// Apply fadeOut envelope, then stop
-			this._fadeGainNode.gain.setValueAtTime(1, computedTime);
-			this._fadeGainNode.gain.linearRampToValueAtTime(0, computedTime + fadeOutTime);
+		// Clear any pending stop timeout
+		this.context.clearTimeout(this._stopTimeoutId);
 
-			// Delay the actual stop until after fadeOut completes
-			setTimeout(() => {
+		if (fadeOutTime > 0) {
+			// Apply fadeOut envelope
+			if (this._fadeCurve === "linear") {
+				this._fadeGainNode.gain.linearRampTo(0, fadeOutTime, computedTime);
+			} else {
+				this._fadeGainNode.gain.targetRampTo(0, fadeOutTime, computedTime);
+			}
+		}
+
+		// Calculate delay from now until stop should happen
+		const stopTime = computedTime + fadeOutTime;
+		const delay = stopTime - this.context.currentTime;
+
+		if (delay > 0) {
+			// Schedule the actual stop using Tone's precise timing
+			this._stopTimeoutId = this.context.setTimeout(() => {
+				this._stopTimeoutId = -1;
 				if (this._workletNode) {
 					this._workletNode.port.postMessage({ type: "stop" });
 				}
-			}, fadeOutTime * 1000);
+			}, delay);
 		} else {
+			// Stop immediately
 			if (this._workletNode) {
 				this._workletNode.port.postMessage({ type: "stop" });
 			}
@@ -550,6 +644,22 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	}
 
 	/**
+	 * Use quick seek mode for faster but lower quality time stretching.
+	 * This is a read-only property that must be set at construction time.
+	 */
+	get useQuickSeek(): boolean {
+		return this._useQuickSeek;
+	}
+
+	/**
+	 * Use anti-alias filter for higher quality pitch shifting.
+	 * This is a read-only property that must be set at construction time.
+	 */
+	get useAaFilter(): boolean {
+		return this._useAaFilter;
+	}
+
+	/**
 	 * Whether the audio should loop
 	 */
 	get loop(): boolean {
@@ -637,7 +747,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 * If the buffer is loaded
 	 */
 	get loaded(): boolean {
-		return this._buffer.loaded;
+		return this._loaded;
 	}
 
 	/**
@@ -651,15 +761,23 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 * Dispose and clean up
 	 */
 	dispose(): this {
-		super.dispose();
-		this._buffer.dispose();
-		this._fadeGainNode.disconnect();
+		this.context.clearTimeout(this._stopTimeoutId);
+		this._stopTimeoutId = -1;
+
+		// Clean up worklet node
 		if (this._workletNode) {
 			this._workletNode.port.postMessage({ type: "dispose" });
+			this._workletNode.port.onmessage = null;
 			this._workletNode.disconnect();
 			this._workletNode = null;
 		}
+
+		// Clean up buffer and fade gain node
+		this._buffer.dispose();
+		this._fadeGainNode.dispose();
+
+		// Call super.dispose last
+		super.dispose();
 		return this;
 	}
 }
-

@@ -441,8 +441,9 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
       try { this.soundtouch.clear(); } catch (e) {}
       this.soundtouch = null;
     }
-    
+
     this.port.postMessage({ type: 'disposed' });
+    this.port.onmessage = null;
   }
   
   // --- Main Processing ---
@@ -514,18 +515,24 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   }
   
   handleEndOfAudio(samplesCount) {
-    for (let i = 0; i < MAX_FLUSH_ITERATIONS; i++) {
-      const received = this.soundtouch.receiveSamples(this.receiveBuffer);
-      if (received <= 0) break;
-      this.writeToRingBuffer(this.receiveBuffer, received);
-      this.playbackTime += received / this.sampleRate;
-    }
-    
-    const neededSamples = samplesCount * this.channels;
-    if (this.ringAvailable < neededSamples) {
-      if (this.loop) {
+    if (this.loop) {
+      // In loop mode, just handle the loop without flushing
+      const neededSamples = samplesCount * this.channels;
+      if (this.ringAvailable < neededSamples) {
         if (!this.handleLoop()) this.endPlayback();
-      } else if (this.ringAvailable <= 0) {
+      }
+    } else {
+      // In non-loop mode, flush SoundTouch to get all remaining samples
+      this.soundtouch.flush();
+      
+      for (let i = 0; i < MAX_FLUSH_ITERATIONS; i++) {
+        const received = this.soundtouch.receiveSamples(this.receiveBuffer);
+        if (received <= 0) break;
+        this.writeToRingBuffer(this.receiveBuffer, received);
+        this.playbackTime += received / this.sampleRate;
+      }
+      
+      if (this.ringAvailable <= 0) {
         this.endPlayback();
       }
     }

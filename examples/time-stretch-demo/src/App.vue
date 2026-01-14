@@ -293,7 +293,10 @@ async function createPlayer() {
       fadeIn: fadeIn.value,
       fadeOut: fadeOut.value,
       autostart: autostart.value,
-      wasmUrl: wasmBytes,
+      fadeCurve: "exponential",
+      useQuickSeek: true,   // Fast but low-quality time stretching
+      useAaFilter: false,   // Enable anti-aliasing filter for higher quality pitch shifting
+      wasmBytes: wasmBytes,
       soundtouchCode: soundtouchCode,
       onload: () => {
         loaded.value = true;
@@ -330,6 +333,10 @@ async function createPlayer() {
 
 // Load audio
 async function loadAudio() {
+  // If autostart is enabled, start AudioContext first (must be in user action context)
+  if (autostart.value) {
+    await Tone.start();
+  }
   await createPlayer();
 }
 
