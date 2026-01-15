@@ -87,6 +87,60 @@
         </div>
       </div>
 
+      <!-- Playback Rate Control -->
+      <div class="control-section">
+        <h2>Playback Rate (Tape Speed)</h2>
+        <p class="section-description">
+          Unlike Tempo, playbackRate affects both speed AND pitch together, 
+          similar to changing the speed of a tape or vinyl record.
+        </p>
+        
+        <div class="control-group">
+          <label>Playback Rate: {{ playbackRate.toFixed(2) }}x</label>
+          <input 
+            type="range" 
+            v-model.number="playbackRate" 
+            min="0.25" 
+            max="4" 
+            step="0.05"
+            @input="updatePlaybackRate"
+          />
+          <div class="range-labels">
+            <span>0.25x (Slow + Low)</span>
+            <span>1x (Normal)</span>
+            <span>4x (Fast + High)</span>
+          </div>
+        </div>
+
+        <div class="comparison-info">
+          <h4>Tempo vs PlaybackRate Comparison</h4>
+          <table class="comparison-table">
+            <thead>
+              <tr>
+                <th>Parameter</th>
+                <th>Speed Change</th>
+                <th>Pitch Change</th>
+                <th>Use Case</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Tempo</td>
+                <td>✓ Yes</td>
+                <td>✗ No (preserved)</td>
+                <td>Time stretching, DJ beatmatching</td>
+              </tr>
+              <tr>
+                <td>PlaybackRate</td>
+                <td>✓ Yes</td>
+                <td>✓ Yes (proportional)</td>
+                <td>Tape/vinyl speed, special effects</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
       <!-- Loop Control -->
       <div class="control-section">
         <h2>Loop Control</h2>
@@ -228,6 +282,7 @@ const audioUrl = ref('/sample.mp3');
 // Player parameters
 const tempo = ref(1);
 const pitch = ref(0);
+const playbackRate = ref(1);
 const loop = ref(false);
 const loopStart = ref(0);
 const loopEnd = ref(0);
@@ -286,6 +341,7 @@ async function createPlayer() {
       url: audioUrl.value,
       tempo: tempo.value,
       pitch: pitch.value,
+      playbackRate: playbackRate.value,
       loop: loop.value,
       loopStart: loopStart.value,
       loopEnd: loopEnd.value,
@@ -411,6 +467,12 @@ function updatePitch() {
   }
 }
 
+function updatePlaybackRate() {
+  if (player) {
+    player.playbackRate = playbackRate.value;
+  }
+}
+
 function updateLoop() {
   if (player) {
     player.loop = loop.value;
@@ -487,6 +549,7 @@ function testChipmunk() {
 function resetAll() {
   tempo.value = 1;
   pitch.value = 0;
+  playbackRate.value = 1;
   loop.value = false;
   loopStart.value = 0;
   loopEnd.value = duration.value || 0;
@@ -497,6 +560,7 @@ function resetAll() {
   if (player) {
     updateTempo();
     updatePitch();
+    updatePlaybackRate();
     updateLoop();
     updateFade();
     updateReverse();
@@ -707,5 +771,62 @@ button:disabled {
 
 .error-section h3 {
   margin-top: 0;
+}
+
+.section-description {
+  color: #718096;
+  font-size: 0.95em;
+  margin-bottom: 15px;
+  padding: 10px;
+  background: #f7fafc;
+  border-radius: 6px;
+  border-left: 3px solid #667eea;
+}
+
+.comparison-info {
+  margin-top: 20px;
+  padding: 15px;
+  background: #f7fafc;
+  border-radius: 8px;
+}
+
+.comparison-info h4 {
+  margin-top: 0;
+  color: #2d3748;
+  margin-bottom: 10px;
+}
+
+.control-group h4 {
+  margin-top: 0;
+  margin-bottom: 10px;
+  color: #4a5568;
+}
+
+.comparison-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+
+.comparison-table th,
+.comparison-table td {
+  padding: 10px;
+  text-align: left;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.comparison-table th {
+  background: #edf2f7;
+  font-weight: 600;
+  color: #2d3748;
+}
+
+.comparison-table tr:last-child td {
+  border-bottom: none;
+}
+
+.comparison-table td:first-child {
+  font-weight: 600;
+  color: #667eea;
 }
 </style>

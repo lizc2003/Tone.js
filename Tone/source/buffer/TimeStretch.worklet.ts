@@ -29,6 +29,7 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     this.useAaFilter = opts.useAaFilter ?? false;
     this.tempo = opts.tempo || 1.0;
     this.pitch = opts.pitch || 0;
+    this.rate = opts.rate || 1.0;
     this.wasmBytes = opts.wasmBytes;
     this.soundtouchCode = opts.soundtouchCode;
     
@@ -95,7 +96,10 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
       );
       this.soundtouch.setTempo(this.tempo);
       this.soundtouch.setPitchSemitones(this.pitch);
-        
+      if (this.rate !== 1.0) {
+        this.soundtouch.setRate(this.rate);
+      }
+
       this.initialized = true;
       this.port.postMessage({ type: 'initialized' });
     } catch (err) {
@@ -124,7 +128,7 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   
   setupMessageHandler() {
     this.port.onmessage = ({ data }) => {
-      const { type, value, audioData, offset, loop, loopStart, loopEnd } = data;
+      const { type, value, audioData, offset, loop, loopStart, loopEnd, sharedBuffer, channels, sampleRate } = data;
       
       const handlers = {
         dispose: () => this.dispose(),
@@ -132,6 +136,7 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
         setPitch: () => this.setPitch(value),
         setRate: () => this.setRate(value),
         setAudioData: () => this.setAudioData(audioData, offset, loop, loopStart, loopEnd),
+        setSharedAudioData: () => this.setSharedAudioData(sharedBuffer, channels, sampleRate, offset, loop, loopStart, loopEnd),
         start: () => this.start(offset),
         stop: () => this.stop(),
         pause: () => this.pause(),
@@ -177,6 +182,54 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
       channels: audioData.length,
       length: this.audioDataLength,
       sampleRate: this.sampleRate
+    });
+  }
+  
+  /**
+   * Set audio data from SharedArrayBuffer (zero-copy).
+   * The SharedArrayBuffer contains planar audio data: [L0, L1, ..., Ln, R0, R1, ..., Rn]
+   */
+  setSharedAudioData(sharedBuffer, channels, sampleRate, offset = 0, loop = false, loopStart = 0, loopEnd = 0) {
+    if (!sharedBuffer || !(sharedBuffer instanceof SharedArrayBuffer)) {
+      this.reportError('Invalid SharedArrayBuffer provided');
+      return;
+    }
+    
+    // Update sample rate if provided
+    if (sampleRate && sampleRate !== this.sampleRate) {
+      this.sampleRate = sampleRate;
+    }
+    
+    // Create Float32Array views directly on the SharedArrayBuffer (zero-copy)
+    const floatView = new Float32Array(sharedBuffer);
+    const totalSamples = floatView.length;
+    const samplesPerChannel = Math.floor(totalSamples / channels);
+    
+    // Create array of Float32Array views for each channel (planar format)
+    this.audioData = [];
+    for (let ch = 0; ch < channels; ch++) {
+      const channelOffset = ch * samplesPerChannel;
+      // Create a view into the SharedArrayBuffer for this channel
+      this.audioData.push(new Float32Array(sharedBuffer, channelOffset * Float32Array.BYTES_PER_ELEMENT, samplesPerChannel));
+    }
+    
+    this.channels = channels;
+    this.audioDataLength = samplesPerChannel;
+    this.audioDataPosition = this.clamp(offset, 0, this.audioDataLength);
+    this.loop = loop;
+    this.loopStart = Math.max(0, loopStart);
+    this.loopEnd = loopEnd > 0 ? Math.min(loopEnd, this.audioDataLength) : this.audioDataLength;
+    this.playbackTime = this.audioDataPosition / this.sampleRate;
+    
+    this.clearBuffers();
+    
+    this.port.postMessage({
+      type: 'audioDataLoaded',
+      duration: this.audioDataLength / this.sampleRate,
+      channels: channels,
+      length: this.audioDataLength,
+      sampleRate: this.sampleRate,
+      sharedBuffer: true
     });
   }
   
@@ -251,7 +304,11 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   }
   
   setRate(value) {
-    this.soundtouch?.setRate(this.clamp(value, 0.1, 4.0));
+    const newRate = this.clamp(value, 0.1, 4.0);
+    if (Math.abs(newRate - this.rate) > 0.001) {
+      this.rate = newRate;
+      this.soundtouch?.setRate(this.rate);
+    }
   }
   
   // --- Buffer Management ---

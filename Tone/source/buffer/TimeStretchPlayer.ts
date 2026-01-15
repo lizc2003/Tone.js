@@ -20,6 +20,11 @@ export interface TimeStretchPlayerOptions extends SourceOptions {
 	url?: ToneAudioBuffer | string | AudioBuffer;
 	tempo: Positive;
 	pitch: Cents;
+	/**
+	 * The playback rate. 1 = normal speed, 2 = double speed (and pitch), 0.5 = half speed (and pitch).
+	 * Unlike tempo, this affects both speed AND pitch together, similar to a tape speed change.
+	 */
+	playbackRate: Positive;
 	loop: boolean;
 	loopStart: Time;
 	loopEnd: Time;
@@ -103,6 +108,11 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	private _pitch: Cents = 0;
 
 	/**
+	 * The playback rate (affects both speed and pitch)
+	 */
+	private _playbackRate: Positive = 1;
+
+	/**
 	 * Whether to loop the audio
 	 */
 	private _loop: boolean = false;
@@ -141,6 +151,21 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 * Use anti-alias filter for higher quality pitch shifting
 	 */
 	private _useAaFilter: boolean = false;
+
+	/**
+	 * SharedArrayBuffer for zero-copy audio data sharing with worklet
+	 */
+	private _sharedBuffer: SharedArrayBuffer | null = null;
+
+	/**
+	 * Number of channels when using SharedArrayBuffer
+	 */
+	private _sharedBufferChannels: number = 0;
+
+	/**
+	 * Sample rate when using SharedArrayBuffer
+	 */
+	private _sharedBufferSampleRate: number = 0;
 
 	/**
 	 * Current playback position in samples
@@ -226,6 +251,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		this.autostart = options.autostart;
 		this._tempo = options.tempo;
 		this._pitch = options.pitch;
+		this._playbackRate = options.playbackRate;
 		this._loop = options.loop;
 		this._loopStart = options.loopStart;
 		this._loopEnd = options.loopEnd;
@@ -258,6 +284,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			reverse: false,
 			pitch: 0 as Cents,
 			tempo: 1 as Positive,
+			playbackRate: 1 as Positive,
 			useQuickSeek: true,
 			useAaFilter: false,
 		});
@@ -335,6 +362,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 				sampleRate: this.context.sampleRate,
 				tempo: this._tempo,
 				pitch: this._pitch,
+				rate: this._playbackRate,
 				wasmBytes: this._wasmBytes,
 				soundtouchCode: this._soundtouchCode,
 				channels: channels,
@@ -403,6 +431,62 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 */
 	async load(url: string): Promise<this> {
 		await this._buffer.load(url);
+		await this._initWorklet();
+		return this;
+	}
+
+	/**
+	 * Load audio data from a SharedArrayBuffer with non-interleaved (planar) format.
+	 * The SharedArrayBuffer is passed directly to the AudioWorklet without copying,
+	 * enabling zero-copy audio data sharing between the main thread and worklet.
+	 * 
+	 * Each channel's samples are stored contiguously in the buffer.
+	 * 
+	 * @param sharedBuffer The SharedArrayBuffer containing audio data in planar format
+	 * @param numberOfChannels The number of audio channels (e.g., 1 for mono, 2 for stereo)
+	 * @param sampleRate Optional sample rate of the audio data. Defaults to the context's sample rate.
+	 * @returns Promise that resolves to this player instance
+	 * 
+	 * @example
+	 * // Create a SharedArrayBuffer with stereo audio data in planar format
+	 * // Data layout: [L0, L1, L2, ..., Ln, R0, R1, R2, ..., Rn]
+	 * const samplesPerChannel = 44100 * 10; // 10 seconds
+	 * const sharedBuffer = new SharedArrayBuffer(samplesPerChannel * 2 * Float32Array.BYTES_PER_ELEMENT);
+	 * const view = new Float32Array(sharedBuffer);
+	 * // Fill left channel samples at view[0..samplesPerChannel-1]
+	 * // Fill right channel samples at view[samplesPerChannel..2*samplesPerChannel-1]
+	 * 
+	 * const player = new Tone.TimeStretchPlayer({
+	 *   wasmBytes: wasmBytes,
+	 *   soundtouchCode: soundtouchCode,
+	 * }).toDestination();
+	 * 
+	 * await player.loadSharedArrayBuffer(sharedBuffer, 2, 44100);
+	 * player.start();
+	 */
+	async loadSharedArrayBuffer(
+		sharedBuffer: SharedArrayBuffer,
+		numberOfChannels: number,
+		sampleRate?: number
+	): Promise<this> {
+		assert(
+			sharedBuffer instanceof SharedArrayBuffer,
+			"Expected a SharedArrayBuffer"
+		);
+		assert(
+			numberOfChannels > 0,
+			"numberOfChannels must be greater than 0"
+		);
+
+		// Store SharedArrayBuffer reference for zero-copy sharing with worklet
+		this._sharedBuffer = sharedBuffer;
+		this._sharedBufferChannels = numberOfChannels;
+		this._sharedBufferSampleRate = sampleRate ?? this.context.sampleRate;
+
+		// Initialize the worklet
+		await this._initWorklet();
+		this._loaded = true;
+
 		return this;
 	}
 
@@ -434,11 +518,30 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		this._fadeGainNode.gain.cancelScheduledValues(0);
 		this._fadeGainNode.gain.setValueAtTime(1, this.context.currentTime);
 
-		// Prepare audio data
-		const audioBuffer = this._buffer.get();
-		if (!audioBuffer) {
-			console.warn("TimeStretchPlayer: Buffer not loaded");
-			return;
+		// Determine if using SharedArrayBuffer or regular buffer
+		const useSharedBuffer = this._sharedBuffer !== null;
+		
+		let numberOfChannels: number;
+		let bufferDuration: number;
+		let sampleRate: number;
+
+		if (useSharedBuffer) {
+			// Using SharedArrayBuffer - zero copy path
+			numberOfChannels = this._sharedBufferChannels;
+			sampleRate = this._sharedBufferSampleRate;
+			const floatView = new Float32Array(this._sharedBuffer!);
+			const samplesPerChannel = Math.floor(floatView.length / numberOfChannels);
+			bufferDuration = samplesPerChannel / sampleRate;
+		} else {
+			// Using regular AudioBuffer
+			const audioBuffer = this._buffer.get();
+			if (!audioBuffer) {
+				console.warn("TimeStretchPlayer: Buffer not loaded");
+				return;
+			}
+			numberOfChannels = audioBuffer.numberOfChannels;
+			bufferDuration = this._buffer.duration;
+			sampleRate = this.context.sampleRate;
 		}
 
 		// Check if worklet is initialized
@@ -448,20 +551,15 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		}
 
 		// Create worklet node with the correct number of channels
-		this._createWorkletNode(audioBuffer.numberOfChannels);
-
-		const audioData: Float32Array[] = [];
-		for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-			audioData.push(audioBuffer.getChannelData(ch));
-		}
+		this._createWorkletNode(numberOfChannels);
 
 		const computedOffset = this.toSeconds(defaultArg(offset, 0));
-		const offsetSamples = Math.floor(computedOffset * this.context.sampleRate);
+		const offsetSamples = Math.floor(computedOffset * sampleRate);
 		const computedStartTime = this.toSeconds(startTime);
 
 		const loopEndSeconds =
 			this._loopEnd === 0
-				? this._buffer.duration
+				? bufferDuration
 				: this.toSeconds(this._loopEnd);
 
 		// Apply fadeIn envelope
@@ -478,16 +576,34 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		}
 
 		// Send audio data to worklet
-		this._workletNode!.port.postMessage({
-			type: "setAudioData",
-			audioData: audioData,
-			offset: offsetSamples,
-			loop: this._loop,
-			loopStart: Math.floor(
-				this.toSeconds(this._loopStart) * this.context.sampleRate
-			),
-			loopEnd: Math.floor(loopEndSeconds * this.context.sampleRate),
-		});
+		if (useSharedBuffer) {
+			// Zero-copy: pass SharedArrayBuffer directly to worklet
+			this._workletNode!.port.postMessage({
+				type: "setSharedAudioData",
+				sharedBuffer: this._sharedBuffer,
+				channels: numberOfChannels,
+				sampleRate: sampleRate,
+				offset: offsetSamples,
+				loop: this._loop,
+				loopStart: Math.floor(this.toSeconds(this._loopStart) * sampleRate),
+				loopEnd: Math.floor(loopEndSeconds * sampleRate),
+			});
+		} else {
+			// Regular path: copy audio data
+			const audioBuffer = this._buffer.get()!;
+			const audioData: Float32Array[] = [];
+			for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+				audioData.push(audioBuffer.getChannelData(ch));
+			}
+			this._workletNode!.port.postMessage({
+				type: "setAudioData",
+				audioData: audioData,
+				offset: offsetSamples,
+				loop: this._loop,
+				loopStart: Math.floor(this.toSeconds(this._loopStart) * sampleRate),
+				loopEnd: Math.floor(loopEndSeconds * sampleRate),
+			});
+		}
 
 		// Start playback
 		this._workletNode!.port.postMessage({
@@ -644,6 +760,25 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	}
 
 	/**
+	 * The playback rate of the player.
+	 * 1 = normal speed, 2 = double speed, 0.5 = half speed.
+	 * Unlike tempo, this affects both speed AND pitch together,
+	 * similar to changing the speed of a tape or vinyl record.
+	 */
+	get playbackRate(): Positive {
+		return this._playbackRate;
+	}
+	set playbackRate(value: Positive) {
+		this._playbackRate = value;
+		if (this._workletNode) {
+			this._workletNode.port.postMessage({
+				type: "setRate",
+				value: value,
+			});
+		}
+	}
+
+	/**
 	 * Use quick seek mode for faster but lower quality time stretching.
 	 * This is a read-only property that must be set at construction time.
 	 */
@@ -775,6 +910,13 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		// Clean up buffer and fade gain node
 		this._buffer.dispose();
 		this._fadeGainNode.dispose();
+		this._wasmBytes = null;
+		this._soundtouchCode = "";
+
+		// Clean up SharedArrayBuffer references
+		this._sharedBuffer = null;
+		this._sharedBufferChannels = 0;
+		this._sharedBufferSampleRate = 0;
 
 		// Call super.dispose last
 		super.dispose();
