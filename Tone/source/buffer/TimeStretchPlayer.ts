@@ -421,7 +421,6 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			})
 			.catch((err) => {
 				console.error("TimeStretchPlayer: Failed to initialize worklet:", err);
-				callback();
 			});
 	}
 
@@ -734,10 +733,17 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	set tempo(value: Positive) {
 		this._tempo = value;
 		if (this._workletNode) {
-			this._workletNode.port.postMessage({
-				type: "setTempo",
-				value: value,
-			});
+			// Try using AudioParam first (supports automation)
+			const tempoParam = this._workletNode.parameters.get('tempo');
+			if (tempoParam) {
+				tempoParam.setValueAtTime(value, this.context.currentTime);
+			} else {
+				// Fallback to postMessage for backward compatibility
+				this._workletNode.port.postMessage({
+					type: "setTempo",
+					value: value,
+				});
+			}
 		}
 	}
 
@@ -752,11 +758,40 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	set pitch(value: Cents) {
 		this._pitch = value;
 		if (this._workletNode) {
-			this._workletNode.port.postMessage({
-				type: "setPitch",
-				value: value,
-			});
+			// Try using AudioParam first (supports automation)
+			const pitchParam = this._workletNode.parameters.get('pitch');
+			if (pitchParam) {
+				pitchParam.setValueAtTime(value, this.context.currentTime);
+			} else {
+				// Fallback to postMessage for backward compatibility
+				this._workletNode.port.postMessage({
+					type: "setPitch",
+					value: value,
+				});
+			}
 		}
+	}
+
+	/**
+	 * Get the AudioParam for tempo automation.
+	 * Returns null if the worklet node is not initialized or doesn't support parameters.
+	 * Use this to schedule tempo changes at specific times, e.g.:
+	 * player.tempoParam?.setValueAtTime(1.0, 0);
+	 * player.tempoParam?.linearRampToValueAtTime(2.0, 10);
+	 */
+	get tempoParam(): AudioParam | null {
+		return this._workletNode?.parameters.get('tempo') ?? null;
+	}
+
+	/**
+	 * Get the AudioParam for pitch automation.
+	 * Returns null if the worklet node is not initialized or doesn't support parameters.
+	 * Use this to schedule pitch changes at specific times, e.g.:
+	 * player.pitchParam?.setValueAtTime(0, 0);
+	 * player.pitchParam?.linearRampToValueAtTime(12, 10);
+	 */
+	get pitchParam(): AudioParam | null {
+		return this._workletNode?.parameters.get('pitch') ?? null;
 	}
 
 	/**

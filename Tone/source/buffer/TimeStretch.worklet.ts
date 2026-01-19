@@ -58,7 +58,12 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     // Progress tracking
     this.lastReportedPosition = 0;
     this.playbackTime = 0;
-    
+
+    // Parameter automation tracking
+    // Store last applied values to detect changes from AudioParam automation
+    this._lastAppliedTempo = this.tempo;
+    this._lastAppliedPitch = this.pitch;
+
     // Error throttling
     this.lastErrorTime = 0;
     this.errorThrottleMs = 1000;
@@ -504,20 +509,57 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   }
   
   // --- Main Processing ---
-  
-  process(inputs, outputs) {
+
+  process(inputs, outputs, parameters) {
     if (this.disposed) return false;
-    
+
     const output = outputs[0];
     if (!output?.[0]) return true;
-    
+
     const samplesCount = output[0].length;
+
+    // Process AudioParam automation
+    // k-rate parameters have length 1 (one value per render quantum)
+    if (parameters && this.initialized && this.soundtouch) {
+      const tempoParam = parameters.tempo;
+      const pitchParam = parameters.pitch;
+
+      if (tempoParam && tempoParam.length > 0) {
+        const currentTempo = tempoParam[0];
+        // Update SoundTouch only if value changed (avoid unnecessary processing)
+        if (Math.abs(currentTempo - this._lastAppliedTempo) > 0.001) {
+          try {
+            this.soundtouch.setTempo(currentTempo);
+            this._lastAppliedTempo = currentTempo;
+            // Also update instance variable for backward compatibility
+            this.tempo = currentTempo;
+          } catch (e) {
+            // Silently ignore tempo setting errors to avoid console spam
+          }
+        }
+      }
+
+      if (pitchParam && pitchParam.length > 0) {
+        const currentPitch = pitchParam[0];
+        // Update SoundTouch only if value changed
+        if (Math.abs(currentPitch - this._lastAppliedPitch) > 0.1) {
+          try {
+            this.soundtouch.setPitchSemitones(currentPitch);
+            this._lastAppliedPitch = currentPitch;
+            // Also update instance variable for backward compatibility
+            this.pitch = currentPitch;
+          } catch (e) {
+            // Silently ignore pitch setting errors
+          }
+        }
+      }
+    }
 
     if (!this.initialized || !this.soundtouch || !this.playing || !this.audioData || this.paused) {
       this.outputSilence(output);
       return true;
     }
-    
+
     try {
       this.feedSoundTouch(samplesCount);
 
