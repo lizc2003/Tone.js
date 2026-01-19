@@ -13,8 +13,8 @@
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^6.0.1",
-    "soundtouch": "https://github.com/lizc2003/soundtouch-rs/releases/download/v0.4.0/soundtouch-wasm.tgz",
-    "tone": "https://github.com/lizc2003/Tone.js/releases/download/v0.3.0/tone.tgz",
+    "soundtouch": "https://github.com/lizc2003/soundtouch-rs/releases/download/v0.3.0/soundtouch-wasm.tgz",
+    "tone": "https://github.com/lizc2003/Tone.js/releases/download/v0.4.0/tone.tgz",
     "vite": "^7.2.4"
   },
   "// Internal package reference of tone": "file:../../"
