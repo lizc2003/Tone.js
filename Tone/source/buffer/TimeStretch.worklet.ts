@@ -17,6 +17,30 @@ const MAX_ITERATIONS = 10;
 const MAX_FLUSH_ITERATIONS = 3;
 
 class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
+  /**
+   * AudioParam descriptors for automated parameter control
+   * - tempo: playback speed without pitch change (k-rate for efficiency)
+   * - pitch: pitch shift in semitones (k-rate for efficiency)
+   */
+  static get parameterDescriptors() {
+    return [
+      {
+        name: 'tempo',
+        defaultValue: 1.0,
+        minValue: 0.1,
+        maxValue: 4.0,
+        automationRate: 'k-rate'
+      },
+      {
+        name: 'pitch',
+        defaultValue: 0,
+        minValue: -24,
+        maxValue: 24,
+        automationRate: 'k-rate'
+      }
+    ];
+  }
+
   constructor(options) {
     super();
     
