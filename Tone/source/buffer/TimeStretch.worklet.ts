@@ -10,7 +10,6 @@ let wasmInitialized = false;
 let SoundTouchWasm = null;
 
 // Constants
-const RING_BUFFER_SIZE = 16384;
 const PROGRESS_REPORT_INTERVAL = 4096;
 const MAX_CHUNK_SIZE = 4096;
 const MAX_ITERATIONS = 10;
@@ -36,6 +35,13 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
         defaultValue: 0,
         minValue: -24,
         maxValue: 24,
+        automationRate: 'k-rate'
+      },
+      {
+        name: 'rate',
+        defaultValue: 1,
+        minValue: 0.1,
+        maxValue: 4.0,
         automationRate: 'k-rate'
       }
     ];
@@ -72,12 +78,16 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     this.loopStart = 0;
     this.loopEnd = 0;
     
-    // Ring buffer (power of 2 for efficient masking)
-    this.initRingBuffer();
-    
     // Working buffers
     this.inputBuffer = new Float32Array(MAX_CHUNK_SIZE * this.channels);
+    // receiveBuffer needs to be large enough to hold a full render quantum (128 samples typically)
+    // Make it larger to handle cases where we need more data
     this.receiveBuffer = new Float32Array(MAX_CHUNK_SIZE * this.channels * 2);
+    this.outputBuffer = new Float32Array(MAX_CHUNK_SIZE * this.channels); // Buffer for current output
+    
+    // Track receiveBuffer usage: how many frames are available and current read position
+    this.receiveBufferAvailableFrames = 0; // Number of frames available in receiveBuffer
+    this.receiveBufferReadOffset = 0; // Current read position in receiveBuffer (in samples)
     
     // Progress tracking
     this.lastReportedPosition = 0;
@@ -142,19 +152,6 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     }
   }
 
-  initRingBuffer() {
-    const requiredSize = RING_BUFFER_SIZE * this.channels;
-    let size = 1;
-    while (size < requiredSize) size <<= 1;
-    
-    this.ringBufferSize = size;
-    this.ringBufferMask = size - 1;
-    this.ringBuffer = new Float32Array(size);
-    this.ringReadPtr = 0;
-    this.ringWritePtr = 0;
-    this.ringAvailable = 0;
-  }
-  
   setupMessageHandler() {
     this.port.onmessage = ({ data }) => {
       const { type, value, audioData, offset, loop, loopStart, loopEnd, sharedBuffer, channels, sampleRate } = data;
@@ -343,67 +340,11 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   // --- Buffer Management ---
   
   clearBuffers() {
-    if (this.ringBuffer) {
-      this.ringBuffer.fill(0);
-    }
-    this.ringReadPtr = 0;
-    this.ringWritePtr = 0;
-    this.ringAvailable = 0;
     this.lastReportedPosition = this.audioDataPosition;
     this.soundtouch?.clear();
-  }
-  
-  writeToRingBuffer(samples, samplesCount) {
-    const totalSamples = samplesCount * this.channels;
-    
-    if (this.ringAvailable + totalSamples > this.ringBufferSize) {
-      return false;
-    }
-    
-    const writePtr = this.ringWritePtr;
-    
-    if (writePtr + totalSamples <= this.ringBufferSize) {
-      this.ringBuffer.set(samples.subarray(0, totalSamples), writePtr);
-      this.ringWritePtr = (writePtr + totalSamples) & this.ringBufferMask;
-    } else {
-      const firstPart = this.ringBufferSize - writePtr;
-      const secondPart = totalSamples - firstPart;
-      
-      this.ringBuffer.set(samples.subarray(0, firstPart), writePtr);
-      this.ringBuffer.set(samples.subarray(firstPart, totalSamples), 0);
-      this.ringWritePtr = secondPart;
-    }
-    
-    this.ringAvailable += totalSamples;
-    return true;
-  }
-  
-  readFromRingBuffer(output, samplesCount) {
-    const { channels, ringBuffer, ringBufferMask } = this;
-    let ptr = this.ringReadPtr;
-    
-    if (channels === 2 && output.length >= 2) {
-      const left = output[0];
-      const right = output[1];
-      
-      for (let i = 0; i < samplesCount; i++) {
-        left[i] = ringBuffer[ptr];
-        right[i] = ringBuffer[ptr + 1];
-        ptr = (ptr + 2) & ringBufferMask;
-      }
-    } else {
-      for (let i = 0; i < samplesCount; i++) {
-        for (let ch = 0; ch < channels && ch < output.length; ch++) {
-          if (output[ch]) {
-            output[ch][i] = ringBuffer[ptr + ch];
-          }
-        }
-        ptr = (ptr + channels) & ringBufferMask;
-      }
-    }
-    
-    this.ringReadPtr = ptr;
-    this.ringAvailable -= samplesCount * channels;
+    // Reset receiveBuffer tracking
+    this.receiveBufferAvailableFrames = 0;
+    this.receiveBufferReadOffset = 0;
   }
   
   fillInputBuffer(chunkSize, startPosition) {
@@ -460,22 +401,6 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     }
   }
   
-  clampOutput(output, samplesCount) {
-    for (const channel of output) {
-      if (!channel) continue;
-      for (let i = 0; i < samplesCount; i++) {
-        const val = channel[i];
-        if (!Number.isFinite(val)) {
-          channel[i] = 0;
-        } else if (val < -1.0) {
-          channel[i] = -1.0;
-        } else if (val > 1.0) {
-          channel[i] = 1.0;
-        }
-      }
-    }
-  }
-  
   handleLoop() {
     if (!this.loop) return false;
     
@@ -486,9 +411,6 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     this.audioDataPosition = this.loopStart + (overshoot % loopLength);
     
     this.soundtouch?.clear();
-    this.ringReadPtr = 0;
-    this.ringWritePtr = 0;
-    this.ringAvailable = 0;
     
     this.port.postMessage({
       type: 'loop',
@@ -508,7 +430,6 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   sendStats() {
     this.port.postMessage({
       type: 'stats',
-      ringBufferUsage: (this.ringAvailable / this.ringBufferSize * 100).toFixed(1),
       playing: this.playing,
       paused: this.paused
     });
@@ -521,7 +442,7 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     this.audioData = null;
     this.inputBuffer = null;
     this.receiveBuffer = null;
-    this.ringBuffer = null;
+    this.outputBuffer = null;
     
     if (this.soundtouch) {
       try { this.soundtouch.clear(); } catch (e) {}
@@ -585,10 +506,22 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
     }
 
     try {
-      this.feedSoundTouch(samplesCount);
+      // feedSoundTouch will keep trying until it gets enough data or audio ends
+      const receivedFrames = this.feedSoundTouch(samplesCount);
 
+      // Handle end of audio
       if (this.audioDataPosition >= this.loopEnd) {
-        this.handleEndOfAudio(samplesCount);
+        if (this.loop) {
+          // In loop mode, handle the loop
+          if (!this.handleLoop()) {
+            this.endPlayback();
+          }
+        } else {
+          // In non-loop mode, if we got no data, end playback
+          if (receivedFrames <= 0) {
+            this.endPlayback();
+          }
+        }
       }
 
       const positionDelta = Math.abs(this.audioDataPosition - this.lastReportedPosition);
@@ -596,13 +529,12 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
         this.port.postMessage({
           type: 'progress',
           position: this.audioDataPosition,
-          playbackTime: this.playbackTime,
-          bufferLevel: this.ringAvailable / this.ringBufferSize
+          playbackTime: this.playbackTime
         });
         this.lastReportedPosition = this.audioDataPosition;
       }
 
-      this.outputAudio(output, samplesCount);
+      this.outputAudio(output, samplesCount, receivedFrames);
     } catch (err) {
       console.error('Processing error:', err);
       this.outputSilence(output);
@@ -613,72 +545,126 @@ class SoundTouchTimeStretchProcessor extends AudioWorkletProcessor {
   }
   
   feedSoundTouch(samplesCount) {
-    const neededSamples = samplesCount * this.channels;
-    let iterations = 0;
+    const { channels } = this;
+    let totalProduced = 0;
     
-    while (this.ringAvailable < neededSamples && 
-           this.audioDataPosition < this.loopEnd &&
-           iterations++ < MAX_ITERATIONS) {
+    // Loop until accumulated output data is sufficient for samplesCount
+    let loopCount = 0;
+    const maxLoops = 100; // Maximum loop count to prevent infinite loops
+    
+    while (totalProduced < samplesCount && loopCount < maxLoops) {
+      loopCount++;
       
-      const chunkSize = Math.min(MAX_CHUNK_SIZE, this.loopEnd - this.audioDataPosition);
-      if (chunkSize <= 0) break;
+      // Calculate how many frames are still needed
+      const neededFrames = samplesCount - totalProduced;
+
+      // First try to get data from receiveBuffer (if there's unused data from previous calls)
+      if (this.receiveBufferAvailableFrames > 0) {
+        const framesToUse = Math.min(neededFrames, this.receiveBufferAvailableFrames);
+        const samplesToUse = framesToUse * channels;
+        const readOffset = this.receiveBufferReadOffset;
+        const writeOffset = totalProduced * channels;
+        
+        // Copy directly from receiveBuffer to outputBuffer (both are interleaved format)
+        this.outputBuffer.set(
+          this.receiveBuffer.subarray(readOffset, readOffset + samplesToUse),
+          writeOffset
+        );
+        totalProduced += framesToUse;
+        this.playbackTime += framesToUse / this.sampleRate;
+        
+        this.receiveBufferReadOffset += samplesToUse;
+        this.receiveBufferAvailableFrames -= framesToUse;
+        if (this.receiveBufferAvailableFrames === 0) {
+          this.receiveBufferReadOffset = 0;
+        }
+        if (totalProduced >= samplesCount) {
+          break;
+        }
+      }
       
-      const actualChunkSize = this.fillInputBuffer(chunkSize, this.audioDataPosition);
-      if (actualChunkSize <= 0) break;
-      
-      this.soundtouch.putSamples(this.inputBuffer.subarray(0, actualChunkSize * this.channels));
-      this.audioDataPosition += actualChunkSize;
-      
-      const received = this.soundtouch.receiveSamples(this.receiveBuffer);
-      if (received > 0) {
-        if (!this.writeToRingBuffer(this.receiveBuffer, received)) break;
-        this.playbackTime += received / this.sampleRate;
+      // If receiveBuffer has no data or not enough, need to feed data first, then get data
+      if (totalProduced < samplesCount) {
+        const availableFrames = this.loopEnd - this.audioDataPosition;
+        if (availableFrames <= 0) {
+          // No more source data available, try to flush SoundTouch to get remaining data
+          this.soundtouch.flush();
+          const flushReceived = this.soundtouch.receiveSamples(this.receiveBuffer);
+          if (flushReceived > 0) {
+            this.receiveBufferAvailableFrames = flushReceived;
+            this.receiveBufferReadOffset = 0;
+            continue;
+          }
+          break;
+        }
+        
+        // Feed data to SoundTouch first
+        // Calculate the number of frames to read this time
+        const readSize = Math.max(128, Math.ceil(samplesCount * (this.tempo || 1)));
+        const framesToRead = Math.min(readSize, availableFrames, MAX_CHUNK_SIZE);
+        const actualChunkSize = this.fillInputBuffer(framesToRead, this.audioDataPosition);
+        if (actualChunkSize <= 0) break;
+        this.soundtouch.putSamples(this.inputBuffer.subarray(0, actualChunkSize * channels));
+        this.audioDataPosition += actualChunkSize;
+        
+        // Then get data from SoundTouch (will get all available data)
+        const received = this.soundtouch.receiveSamples(this.receiveBuffer);        
+        if (received > 0) {
+          this.receiveBufferAvailableFrames = received;
+          this.receiveBufferReadOffset = 0;
+          // Continue loop, next iteration will get data from receiveBuffer
+          continue;
+        }
+      }
+    }
+    return totalProduced;
+  }
+  
+  outputAudio(output, samplesCount, receivedFrames) {
+    if (receivedFrames >= samplesCount) {
+      // We have enough data, output directly from outputBuffer
+      this.outputAudioDirect(output, samplesCount);
+    } else {
+      // Not enough data (should rarely happen, only when audio ends)
+      // Output what we have and fill the rest with silence
+      if (receivedFrames > 0) {
+        this.outputAudioDirect(output, receivedFrames);
+        for (const channel of output) {
+          if (channel) channel.fill(0, receivedFrames);
+        }
+      } else {
+        // No data available, output silence
+        this.outputSilence(output);
       }
     }
   }
   
-  handleEndOfAudio(samplesCount) {
-    if (this.loop) {
-      // In loop mode, just handle the loop without flushing
-      const neededSamples = samplesCount * this.channels;
-      if (this.ringAvailable < neededSamples) {
-        if (!this.handleLoop()) this.endPlayback();
-      }
-    } else {
-      // In non-loop mode, flush SoundTouch to get all remaining samples
-      this.soundtouch.flush();
-      
-      for (let i = 0; i < MAX_FLUSH_ITERATIONS; i++) {
-        const received = this.soundtouch.receiveSamples(this.receiveBuffer);
-        if (received <= 0) break;
-        this.writeToRingBuffer(this.receiveBuffer, received);
-        this.playbackTime += received / this.sampleRate;
-      }
-      
-      if (this.ringAvailable <= 0) {
-        this.endPlayback();
-      }
-    }
-  }
-  
-  outputAudio(output, samplesCount) {
-    const neededSamples = samplesCount * this.channels;
+  outputAudioDirect(output, samplesCount) {
+    const { channels, outputBuffer } = this;
     
-    if (this.ringAvailable >= neededSamples) {
-      this.readFromRingBuffer(output, samplesCount);
-      this.clampOutput(output, samplesCount);
-    } else if (this.ringAvailable > 0) {
-      const availableFrames = Math.floor(this.ringAvailable / this.channels);
-      if (availableFrames > 0) {
-        this.readFromRingBuffer(output, availableFrames);
-        this.clampOutput(output, availableFrames);
+    if (channels === 2 && output.length >= 2) {
+      const left = output[0];
+      const right = output[1];
+      
+      for (let i = 0; i < samplesCount; i++) {
+        left[i] = outputBuffer[i * 2];
+        right[i] = outputBuffer[i * 2 + 1];
       }
-      for (const channel of output) {
-        if (channel) channel.fill(0, availableFrames);
+    } else if (channels === 1) {
+      const mono = output[0];
+      for (let i = 0; i < samplesCount; i++) {
+        mono[i] = outputBuffer[i];
       }
     } else {
-      this.outputSilence(output);
+      for (let i = 0; i < samplesCount; i++) {
+        for (let ch = 0; ch < channels && ch < output.length; ch++) {
+          if (output[ch]) {
+            output[ch][i] = outputBuffer[i * channels + ch];
+          }
+        }
+      }
     }
+    
   }
 }
 

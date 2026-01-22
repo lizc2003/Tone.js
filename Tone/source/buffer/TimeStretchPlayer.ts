@@ -344,15 +344,6 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	 * @param channels The number of audio channels
 	 */
 	private _createWorkletNode(channels: number): void {
-		// Clean up old worklet node properly
-		if (this._workletNode) {
-			// Dispose the old worklet to release WASM resources
-			this._workletNode.port.postMessage({ type: "dispose" });
-			this._workletNode.port.onmessage = null;
-			this._workletNode.disconnect();
-			this._workletNode = null;
-		}
-
 		// Use Tone's context createAudioWorkletNode method
 		this._workletNode = this.context.createAudioWorkletNode(workletName, {
 			numberOfInputs: 0,
@@ -389,11 +380,25 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 				case "error":
 					console.error("TimeStretchPlayer worklet error:", event.data.message);
 					break;
+				case "log":
+					console.log("TimeStretchPlayer worklet warning:", event.data.message);
+					break;
 			}
 		};
 
 		// Connect AudioWorkletNode to fade gain node (which is connected to output)
 		connect(this._workletNode, this._fadeGainNode);
+
+		// Set initial values for AudioParams to match constructor values
+		// This overrides the defaultValue from parameterDescriptors
+		const tempoParam = this._workletNode.parameters.get('tempo');
+		const pitchParam = this._workletNode.parameters.get('pitch');
+		if (tempoParam) {
+			tempoParam.value = this._tempo;
+		}
+		if (pitchParam) {
+			pitchParam.value = this._pitch;
+		}
 	}
 
 	/**
@@ -519,7 +524,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 
 		// Determine if using SharedArrayBuffer or regular buffer
 		const useSharedBuffer = this._sharedBuffer !== null;
-		
+
 		let numberOfChannels: number;
 		let bufferDuration: number;
 		let sampleRate: number;
@@ -543,23 +548,56 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			sampleRate = this.context.sampleRate;
 		}
 
-		// Check if worklet is initialized
-		if (!TimeStretchPlayer._workletRegisteredContexts.has(this.context.rawContext)) {
-			console.error("TimeStretchPlayer: worklet not initialized");
-			return;
-		}
-
-		// Create worklet node with the correct number of channels
-		this._createWorkletNode(numberOfChannels);
-
 		const computedOffset = this.toSeconds(defaultArg(offset, 0));
 		const offsetSamples = Math.floor(computedOffset * sampleRate);
 		const computedStartTime = this.toSeconds(startTime);
+		const loopEndSeconds = this._loopEnd === 0 ? bufferDuration : this.toSeconds(this._loopEnd);
 
-		const loopEndSeconds =
-			this._loopEnd === 0
-				? bufferDuration
-				: this.toSeconds(this._loopEnd);
+		if (!this._workletNode) {
+			// Check if worklet is initialized
+			if (!TimeStretchPlayer._workletRegisteredContexts.has(this.context.rawContext)) {
+				console.error("TimeStretchPlayer: worklet not initialized");
+				return;
+			}
+
+			// Create worklet node with the correct number of channels
+			this._createWorkletNode(numberOfChannels);
+
+			// Send audio data to worklet
+			if (useSharedBuffer) {
+				// Zero-copy: pass SharedArrayBuffer directly to worklet
+				this._workletNode!.port.postMessage({
+					type: "setSharedAudioData",
+					sharedBuffer: this._sharedBuffer,
+					channels: numberOfChannels,
+					sampleRate: sampleRate,
+					offset: offsetSamples,
+					loop: this._loop,
+					loopStart: Math.floor(this.toSeconds(this._loopStart) * sampleRate),
+					loopEnd: Math.floor(loopEndSeconds * sampleRate),
+				});
+			} else {
+				// Regular path: copy audio data
+				const audioBuffer = this._buffer.get()!;
+				const audioData: Float32Array[] = [];
+				for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+					audioData.push(audioBuffer.getChannelData(ch));
+				}
+				this._workletNode!.port.postMessage({
+					type: "setAudioData",
+					audioData: audioData,
+					offset: offsetSamples,
+					loop: this._loop,
+					loopStart: Math.floor(this.toSeconds(this._loopStart) * sampleRate),
+					loopEnd: Math.floor(loopEndSeconds * sampleRate),
+				});
+			}
+
+			// update tempo and pitch to ensure they are correct
+			this.tempo = this._tempo;
+			this.pitch = this._pitch;
+			this.playbackRate = this._playbackRate;
+		}
 
 		// Apply fadeIn envelope
 		const fadeInTime = this.toSeconds(this.fadeIn);
@@ -574,36 +612,6 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 			this._fadeGainNode.gain.setValueAtTime(1, computedStartTime);
 		}
 
-		// Send audio data to worklet
-		if (useSharedBuffer) {
-			// Zero-copy: pass SharedArrayBuffer directly to worklet
-			this._workletNode!.port.postMessage({
-				type: "setSharedAudioData",
-				sharedBuffer: this._sharedBuffer,
-				channels: numberOfChannels,
-				sampleRate: sampleRate,
-				offset: offsetSamples,
-				loop: this._loop,
-				loopStart: Math.floor(this.toSeconds(this._loopStart) * sampleRate),
-				loopEnd: Math.floor(loopEndSeconds * sampleRate),
-			});
-		} else {
-			// Regular path: copy audio data
-			const audioBuffer = this._buffer.get()!;
-			const audioData: Float32Array[] = [];
-			for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
-				audioData.push(audioBuffer.getChannelData(ch));
-			}
-			this._workletNode!.port.postMessage({
-				type: "setAudioData",
-				audioData: audioData,
-				offset: offsetSamples,
-				loop: this._loop,
-				loopStart: Math.floor(this.toSeconds(this._loopStart) * sampleRate),
-				loopEnd: Math.floor(loopEndSeconds * sampleRate),
-			});
-		}
-
 		// Start playback
 		this._workletNode!.port.postMessage({
 			type: "start",
@@ -613,7 +621,7 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 		// Schedule stop if duration is provided
 		if (duration !== undefined) {
 			const computedDuration = this.toSeconds(duration);
-			this.stop(computedStartTime + computedDuration);
+			this.stop(computedStartTime + computedDuration); // TODO: incorrect when tempo!=1
 		}
 	}
 
@@ -806,10 +814,16 @@ export class TimeStretchPlayer extends Source<TimeStretchPlayerOptions> {
 	set playbackRate(value: Positive) {
 		this._playbackRate = value;
 		if (this._workletNode) {
-			this._workletNode.port.postMessage({
-				type: "setRate",
-				value: value,
-			});
+			const playbackRateParam = this._workletNode.parameters.get('rate');
+			if (playbackRateParam) {
+				playbackRateParam.setValueAtTime(value, this.context.currentTime);
+			} else {
+				// Fallback to postMessage for backward compatibility
+				this._workletNode.port.postMessage({
+					type: "setRate",
+					value: value,
+				});
+			}
 		}
 	}
 
